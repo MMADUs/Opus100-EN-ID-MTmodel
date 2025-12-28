@@ -3,11 +3,12 @@
 import time
 import torch
 import torch.nn as nn
+from torch.amp import autocast, GradScaler
 
 from tqdm import tqdm
 
 from dataset import get_dataloaders, causal_mask
-from model import Transformer, initialize_parameters
+from model import build_model
 from config import to_device, get_default_device
 from utils import time_formatter
 
@@ -58,18 +59,7 @@ def train_model(conf, callback):
     train_dl, val_dl, _tdl, tokenizer_src, tokenizer_tgt = get_dataloaders(conf)
 
     # model
-    model = Transformer(
-        src_vocab_size=tokenizer_src.get_vocab_size(),
-        tgt_vocab_size=tokenizer_tgt.get_vocab_size(),
-        src_seq_len=conf.seq_len,
-        tgt_seq_len=conf.seq_len,
-        d_model=conf.d_model,
-        N=conf.num_layers,
-        h=conf.num_heads,
-        dropout=conf.dropout,
-        d_ff=conf.ffn_dim,
-    )
-    initialize_parameters(model)
+    model = build_model(conf, tokenizer_src, tokenizer_tgt)
     model = to_device(model)
 
     # optimizer
@@ -82,6 +72,8 @@ def train_model(conf, callback):
         )
     )
 
+    scaler = GradScaler(device="cuda")
+
     callback.init()
     start_time = time.time()
 
@@ -92,7 +84,7 @@ def train_model(conf, callback):
 
     init_epoch = 0
 
-    for epoch in range(init_epoch, conf.num_epoch):
+    for epoch in range(init_epoch, conf.num_epochs):
         epoch_start = time.time()
         torch.cuda.empty_cache()
         model.train()
@@ -101,56 +93,73 @@ def train_model(conf, callback):
         batch_iter = tqdm(train_dl, desc=f"processing epoch {epoch}")
 
         for batch in batch_iter:
+            # model data input
             encoder_input = to_device(batch["encoder_input"])  # (B, seq_len)
             decoder_input = to_device(batch["decoder_input"])  # (B, seq_len)
+
+            # model mask input
             encoder_mask = to_device(batch["encoder_mask"])  # (B, 1, 1, seq_len)
             decoder_mask = to_device(batch["decoder_mask"])  # (B, 1, seq_len, seq_len)
 
-            # forward
-            proj_output = model(
-                encoder_input, decoder_input, encoder_mask, decoder_mask
-            )
-
-            # compare the output with the label
+            # label to compare with output
             label = to_device(batch["label"])
 
-            # compute loss
-            loss = loss_fn(
-                proj_output.view(-1, tokenizer_tgt.get_vocab_size()), label.view(-1)
-            )
-            train_loss += loss.item()
-
-            batch_iter.set_postfix({"loss": f"{loss.item():6.3f}"})
-
-            # backward + update weights
-            loss.backward()
-            optimizer.step()
+            # reset optimizer
             optimizer.zero_grad(set_to_none=True)
+
+            with autocast(device_type="cuda"):
+                # forward
+                proj_output = model(
+                    encoder_input, decoder_input, encoder_mask, decoder_mask
+                )
+
+                # compute loss
+                loss = loss_fn(
+                    proj_output.view(-1, tokenizer_tgt.get_vocab_size()), label.view(-1)
+                )
+
+            # scale gradient then backward
+            scaler.scale(loss).backward()
+
+            # step optimizer
+            scaler.step(optimizer)
+
+            # update scaler
+            scaler.update()
+
+            train_loss += loss.item()
+            batch_iter.set_postfix({"loss": f"{loss.item():6.3f}"})
 
         model.eval()
         val_loss = 0.0
 
         with torch.no_grad():
             for batch in val_dl:
+                # model data input
                 encoder_input = to_device(batch["encoder_input"])  # (B, seq_len)
                 decoder_input = to_device(batch["decoder_input"])  # (B, seq_len)
+
+                # model mask input
                 encoder_mask = to_device(batch["encoder_mask"])  # (B, 1, 1, seq_len)
                 decoder_mask = to_device(
                     batch["decoder_mask"]
                 )  # (B, 1, seq_len, seq_len)
 
-                # forward
-                proj_output = model(
-                    encoder_input, decoder_input, encoder_mask, decoder_mask
-                )
-
-                # compare the output with the label
+                # label to compare with output
                 label = to_device(batch["label"])
 
-                # compute loss
-                loss = loss_fn(
-                    proj_output.view(-1, tokenizer_tgt.get_vocab_size()), label.view(-1)
-                )
+                with autocast(device_type="cuda"):
+                    # forward
+                    proj_output = model(
+                        encoder_input, decoder_input, encoder_mask, decoder_mask
+                    )
+
+                    # compute loss
+                    loss = loss_fn(
+                        proj_output.view(-1, tokenizer_tgt.get_vocab_size()),
+                        label.view(-1),
+                    )
+
                 val_loss += loss.item()
 
         # avg

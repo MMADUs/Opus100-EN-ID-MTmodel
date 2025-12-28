@@ -54,7 +54,7 @@ class PositionalEncoding(nn.Module):
         p_e = p_e.unsqueeze(0)  # (1, seq_len, d_model)
 
         # register positional encoding as a buffer
-        self.register_buffer("PE", p_e)
+        self.register_buffer("p_e", p_e)
 
     def forward(self, x):
         # positional encoding = embedding + sinusoidal positional encoding
@@ -96,7 +96,9 @@ class MultiHeadAttention(nn.Module):
         if mask is not None:
             # mark with very low value (indicating -inf) to the position where mask == 0
             # this way softmax will make the value 0
-            attention_scores.masked_fill_(mask == 0, -1e9)
+            attention_scores = attention_scores.float()
+            attention_scores.masked_fill_(mask == 0, float('-inf'))
+            attention_scores = attention_scores.to(query.dtype)
 
         # apply softmax
         attention_scores = attention_scores.softmax(dim=-1)
@@ -389,5 +391,25 @@ def initialize_parameters(transformer):
     for p in transformer.parameters():
         if p.dim() > 1:
             nn.init.xavier_uniform_(p)
+
+
+def build_model(conf, tokenizer_src, tokenizer_tgt):
+    # transformer model
+    model = Transformer(
+        src_vocab_size=tokenizer_src.get_vocab_size(),
+        tgt_vocab_size=tokenizer_tgt.get_vocab_size(),
+        src_seq_len=conf.seq_len,
+        tgt_seq_len=conf.seq_len,
+        d_model=conf.d_model,
+        N=conf.num_layers,
+        h=conf.num_heads,
+        dropout=conf.dropout,
+        d_ff=conf.ffn_dim,
+    )
+
+    # init weights
+    initialize_parameters(model)
+
+    return model
 
 # todo: add model test and info

@@ -20,28 +20,51 @@ def get_all_sentences(ds, lang):
         yield item["translation"][lang]
 
 
-def train_tokenizer(conf, ds, lang):
+def get_or_train_tokenizer(conf, ds, lang, train=False):
     # tokenizer path
     tokenizer_path = Path(conf.tokenizer_file.format(lang))
 
-    # train tokenizer vocab
-    tokenizer = Tokenizer(WordLevel(unk_token="[UNK]"))
-    tokenizer.pre_tokenizer = Whitespace()
-    trainer = WordLevelTrainer(
-        special_tokens=["[UNK]", "[PAD]", "[SOS]", "[EOS]"], min_frequency=2
-    )
-    tokenizer.train_from_iterator(get_all_sentences(ds, lang), trainer=trainer)
+    if not Path.exists(tokenizer_path) or train:
+        print(f"tokenizing: {lang}")
+        # train tokenizer if not exist
+        tokenizer = Tokenizer(WordLevel(unk_token="[UNK]"))
+        tokenizer.pre_tokenizer = Whitespace()
+        trainer = WordLevelTrainer(
+            special_tokens=["[UNK]", "[PAD]", "[SOS]", "[EOS]"], min_frequency=2
+        )
+        tokenizer.train_from_iterator(get_all_sentences(ds, lang), trainer=trainer)
 
-    # save tokenizer
-    tokenizer.save(str(tokenizer_path))
+        # save tokenizer
+        tokenizer.save(str(tokenizer_path))
+    else:
+        print(f"tokenizer exist, getting from: {tokenizer_path}")
+        tokenizer = Tokenizer.from_file(str(tokenizer_path))
 
     return tokenizer
 
 
-def get_tokenizers(conf, ds_train):
-    tokenizer_src = train_tokenizer(conf, ds_train, conf.lang_src)
-    tokenizer_tgt = train_tokenizer(conf, ds_train, conf.lang_tgt)
+def get_tokenizers(conf, ds_train, force_retrain_tokenizer=False):
+    tokenizer_src = get_or_train_tokenizer(
+        conf, ds_train, conf.lang_src, force_retrain_tokenizer
+    )
+    tokenizer_tgt = get_or_train_tokenizer(
+        conf, ds_train, conf.lang_tgt, force_retrain_tokenizer
+    )
     return tokenizer_src, tokenizer_tgt
+
+
+def get_max_length_sentence(conf, ds_train, tokenizer_src, tokenizer_tgt):
+    max_len_src = 0
+    max_len_tgt = 0
+
+    for item in ds_train:
+        src_ids = tokenizer_src.encode(item["translation"][conf.lang_src]).ids
+        tgt_ids = tokenizer_tgt.encode(item["translation"][conf.lang_tgt]).ids
+        max_len_src = max(max_len_src, len(src_ids))
+        max_len_tgt = max(max_len_tgt, len(tgt_ids))
+
+    print(f"max length of source sentence: {max_len_src}")
+    print(f"max length of target sentence: {max_len_tgt}")
 
 
 def causal_mask(size):
@@ -155,13 +178,19 @@ class BilingualDataset(Dataset):
         }
 
 
-def get_ds_split(conf, split, tokenizer_src, tokenizer_tgt):
-    ds_raw = load_dataset(
-        f"{conf.corpus}", f"{conf.lang_src}-{conf.lang_tgt}", split=split
-    )
+def get_ds_split(conf, split, tokenizer_src, tokenizer_tgt, ds_raw=None):
+    # load_dataset is used to get val & test, while ds_raw is the splitted train
+    if ds_raw is None:
+        ds = load_dataset(
+            f"{conf.corpus}", f"{conf.lang_src}-{conf.lang_tgt}", split=split
+        )
+    else:
+        ds = ds_raw
+
     dataset = BilingualDataset(
-        ds_raw, tokenizer_src, tokenizer_tgt, conf.src_lang, conf.tgt_lang, conf.seq_len
+        ds, tokenizer_src, tokenizer_tgt, conf.lang_src, conf.lang_tgt, conf.seq_len
     )
+
     return dataset
 
 
@@ -171,36 +200,60 @@ class DeviceDataLoader:
         self.device = device
 
     def __iter__(self):
-        for b in self.dl:
-            yield b.to(self.device)
+        for batch in self.dl:
+            yield self._to_device(batch)
 
     def __len__(self):
         return len(self.dl)
 
+    def _to_device(self, batch):
+        if isinstance(batch, torch.Tensor):
+            return batch.to(self.device)
+        elif isinstance(batch, dict):
+            return {k: self._to_device(v) for k, v in batch.items()}
+        else:
+            return batch  # leave other types untouched
 
-def get_dataloaders(conf):
+
+def get_dataloaders(conf, force_retrain_tokenizer=False):
     # load train split for tokenizer
     ds_train_raw = load_dataset(
         f"{conf.corpus}", f"{conf.lang_src}-{conf.lang_tgt}", split="train"
     )
 
     # configurable subset
-    ds_train_raw = ds_train_raw.train_test_split(
-        train_size=conf.train_set_ratio, seed=42
-    )["train"]
+    if conf.train_set_ratio < 1.0:
+        ds_train_raw = ds_train_raw.train_test_split(
+            train_size=conf.train_set_ratio, seed=42
+        )["train"]
+
+    print("total sentence pair for training:", len(ds_train_raw))
 
     # train tokenizers
-    tokenizer_src, tokenizer_tgt = get_tokenizers(conf, ds_train_raw)
+    tokenizer_src, tokenizer_tgt = get_tokenizers(
+        conf, ds_train_raw, force_retrain_tokenizer
+    )
+
+    # show the optimal seq_len
+    get_max_length_sentence(conf, ds_train_raw, tokenizer_src, tokenizer_tgt)
 
     # build datasets
-    train_ds = get_ds_split(conf, "train", tokenizer_src, tokenizer_tgt)
-    val_ds = get_ds_split(conf, "val", tokenizer_src, tokenizer_tgt)
+    train_ds = get_ds_split(
+        conf, "train", tokenizer_src, tokenizer_tgt, ds_raw=ds_train_raw
+    )
+    val_ds = get_ds_split(conf, "validation", tokenizer_src, tokenizer_tgt)
     test_ds = get_ds_split(conf, "test", tokenizer_src, tokenizer_tgt)
 
     # data loaders
-    train_dl = DataLoader(train_ds, batch_size=conf.batch_size, shuffle=True)
-    val_dl = DataLoader(val_ds, batch_size=1)
-    test_dl = DataLoader(test_ds, batch_size=1)
+    train_dl = DataLoader(
+        train_ds,
+        batch_size=conf.batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+    )
+    val_dl = DataLoader(val_ds, batch_size=1, num_workers=4, pin_memory=True)
+    test_dl = DataLoader(test_ds, batch_size=1, num_workers=4, pin_memory=True)
 
     return (
         DeviceDataLoader(train_dl),
