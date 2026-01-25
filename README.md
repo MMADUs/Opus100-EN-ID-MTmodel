@@ -35,35 +35,6 @@ The model consists of:
 | `seq_len` | 50 | Maximum sequence length |
 | `dropout` | 0.1 | Dropout rate |
 
-## Installation
-
-### Prerequisites
-
-- Python 3.8+
-- CUDA 11.0+ (for GPU acceleration)
-
-### Setup
-
-1. Clone the repository:
-```bash
-git clone https://github.com/yourusername/Opus100-EN-ID-MTmodel.git
-cd Opus100-EN-ID-MTmodel
-```
-
-2. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
-
-3. Download and prepare the dataset:
-```python
-from dataset import get_dataloaders
-from config import en_id_model
-
-# Tokenizers will be trained automatically on first run
-train_dl, val_dl, test_dl, tokenizer_src, tokenizer_tgt = get_dataloaders(en_id_model)
-```
-
 ## Usage
 
 ### Training
@@ -149,14 +120,6 @@ The model is trained on the [Opus100](https://opus.nlpl.eu/opus-100.php) English
 - **Training pairs**: ~1M sentence pairs (configurable)
 - **Vocabulary**: Built using WordLevel tokenizer with min_frequency=2
 - **Special tokens**: [UNK], [PAD], [SOS], [EOS]
-
-## Results
-
-*(Add your results here after training)*
-
-- Validation BLEU: X.XX
-- Validation CER: X.XX%
-- Validation WER: X.XX%
 
 ## Contributing
 
